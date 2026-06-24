@@ -218,3 +218,8 @@ __marimo__/
 .streamlit/secrets.toml
 data/*
 data.zip
+outputs/*
+outputs_real/*
+dataset_reports/*
+dataset_reports_real/*
+*.zip
