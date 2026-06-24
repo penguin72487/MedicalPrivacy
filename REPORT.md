@@ -112,7 +112,7 @@ P(qid -> s) =
 
 程式會將每筆紀錄的 `sensitive_values` 展開後計算，因此同一筆紀錄若同時有多個症狀、診斷或用藥，會分別計入不同的 `s`。
 
-使用完整 QID 後，因為群組更小，部分兩資料集 QID 群組的推斷機率會變高。所有 scope 中保護前最高 `P(qid -> s)` 為 0.80；三方交集 scope 中最高 `P(qid -> s)` 為 0.3846。
+使用完整 QID 後，因為群組更小，部分兩資料集 QID 群組的推斷機率會變高。以跨來源聚合列 (`source=ALL`) 計算時，所有 scope 中保護前最高 `P(qid -> s)` 為 0.80；三方交集 scope 中最高 `P(qid -> s)` 為 0.3846。機率表也保留單一來源診斷列，供檢查資料分布使用，但 C-bounding 的保護目標是跨來源攻擊口徑。
 
 保護前三方交集的高風險例子：
 
@@ -150,7 +150,7 @@ P(qid -> s) <= C
 | FAERS + MIMIC | 9,290 | 9,290 | 17 |
 | VAERS + MIMIC | 2,430 | 2,430 | 1,014 |
 
-保護後所有使用的 QID scope 中，最大 `P(qid -> s)` 皆降至 0.2。
+保護後所有跨來源聚合 (`source=ALL`) 的 QID scope 中，最大 `P(qid -> s)` 皆降至 0.2。
 
 保護後資料與機率表輸出於：
 
@@ -166,3 +166,27 @@ P(qid -> s) <= C
 2. MIMIC-III Demo 有日期 shift；本分析沒有把 MIMIC 日期年份納入三方或 MIMIC 相關兩方 QID。
 3. 單一資料集特有欄位沒有拿來做跨資料集 key；若要做同資料集內的 linking attack，可另外納入這些欄位。
 4. 合成資料中有 `SYN_*` 與 placeholder text，這些在流程中仍當作敏感值示範機率計算；若改用真實去識別資料，可直接重跑同一支程式。
+
+## 7. 真實資料執行效能紀錄
+
+另以 `data/` 中的真實資料執行同一支程式：
+
+```bash
+mamba activate fintech
+python3 scripts/composition_attack.py --data-root data --output-dir outputs_real --c 0.2 --backend auto
+```
+
+本次 Polars / Arrow / cuDF-ready pipeline 完成時間約 84.706 秒。標準化後共有 2,433,758 筆來源紀錄，其中 FAERS 2,207,551 筆、VAERS 226,107 筆、MIMIC 100 筆；敏感資訊長表共有 14,855,061 列。
+
+真資料交集摘要如下：
+
+| 比對範圍 | QID groups | 候選組合 / pair 數 |
+| --- | ---: | ---: |
+| FAERS + VAERS + MIMIC | 58 | 542,187,011 |
+| FAERS + VAERS | 5,980 | 221,688,084 |
+| FAERS + MIMIC | 60 | 860,637 |
+| VAERS + MIMIC | 58 | 49,438 |
+
+三方交集候選明細共有 560,738 筆，其中 FAERS 528,401 筆、VAERS 32,239 筆、MIMIC 98 筆。跨來源聚合 (`source=ALL`) 的三方 scope 保護前最高 `P(qid -> s)` 為 0.1866；套用 C-bounding 後，所有跨來源聚合 QID scope 最高值為 0.2。被 suppress 的敏感值關聯數為：三方 0、FAERS+VAERS 65,298、FAERS+MIMIC 6、VAERS+MIMIC 461。
+
+真資料輸出位於 `outputs_real/`。由於其中包含大量候選紀錄與敏感資訊，本報告不直接列出明細內容。

@@ -119,6 +119,8 @@ python3 scripts/composition_attack.py \
   --backend auto
 ```
 
+執行時預設會顯示 tqdm 進度條；若要在背景執行或輸出乾淨 log，可加上 `--no-progress`。
+
 `--backend auto` 會以 Polars/Arrow 為主，並在偵測到 cuDF 且 CSV 大於門檻時用 GPU 讀取大檔。若要強制使用 GPU CSV reader，可用：
 
 ```bash

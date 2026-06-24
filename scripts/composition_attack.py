@@ -6,7 +6,7 @@ First-principles optimization:
 - Read only required CSV columns.
 - Store normalized records as one columnar table.
 - Store sensitive values as a long table: one row per (record, sensitive value).
-- Use Polars group_by/join/semi-join instead of pandas row iteration.
+- Use Polars group_by/join/semi-join instead of row iteration.
 - Use PyArrow as the interchange format; optionally use cuDF for large CSV reads.
 """
 from __future__ import annotations
@@ -79,6 +79,11 @@ def parse_args() -> argparse.Namespace:
         default=200,
         help="Safety cap for vectorized C-bounding iterations per scope.",
     )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable tqdm progress bars.",
+    )
     return parser.parse_args()
 
 
@@ -88,6 +93,53 @@ def now() -> float:
 
 def log(message: str) -> None:
     print(f"[composition] {message}", flush=True)
+
+
+class NullProgress:
+    def __enter__(self) -> "NullProgress":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+    def update(self, n: int = 1) -> None:
+        return None
+
+    def set_postfix_str(self, text: str, refresh: bool = True) -> None:
+        return None
+
+
+def tqdm_available() -> bool:
+    return importlib.util.find_spec("tqdm") is not None
+
+
+def progress_iter(
+    iterable: Iterable,
+    desc: str,
+    unit: str,
+    enabled: bool = True,
+    total: int | None = None,
+    leave: bool = False,
+) -> Iterable:
+    if not enabled or not tqdm_available():
+        return iterable
+    from tqdm.auto import tqdm
+
+    return tqdm(iterable, total=total, desc=desc, unit=unit, dynamic_ncols=True, leave=leave, mininterval=0.5)
+
+
+def progress_bar(
+    total: int,
+    desc: str,
+    unit: str,
+    enabled: bool = True,
+    leave: bool = False,
+) -> object:
+    if not enabled or not tqdm_available():
+        return NullProgress()
+    from tqdm.auto import tqdm
+
+    return tqdm(total=total, desc=desc, unit=unit, dynamic_ncols=True, leave=leave, mininterval=0.5)
 
 
 def has_cudf() -> bool:
@@ -317,13 +369,18 @@ def aggregate_values(
     )
 
 
-def load_faers(data_root: Path, backend: str, cudf_min_mb: float) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+def load_faers(
+    data_root: Path,
+    backend: str,
+    cudf_min_mb: float,
+    progress: bool,
+) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
     demo_files = sorted(data_root.glob("2004Q1_2012Q4/**/DEMO*.csv"))
     record_frames: list[pl.DataFrame] = []
     sensitive_frames: list[pl.DataFrame] = []
     exposure_frames: list[pl.DataFrame] = []
 
-    for demo_path in demo_files:
+    for demo_path in progress_iter(demo_files, "FAERS files", "file", progress):
         year = year_from_path(demo_path)
         if year is None or not 2004 <= year <= 2012:
             continue
@@ -402,20 +459,25 @@ def load_faers(data_root: Path, backend: str, cudf_min_mb: float) -> tuple[pl.Da
             sensitive_frames.append(drug_sensitive)
             exposure_frames.append(drug_sensitive.select("record_key", "sensitive_value"))
 
-    records = concat_frames(record_frames).unique("record_key", keep="first")
+    records = concat_frames(record_frames).unique(subset=["record_key"], keep="first")
     sensitive = concat_frames(sensitive_frames, ["source", "record_id", "record_key", "sensitive_value"])
     exposure = concat_frames(exposure_frames, ["record_key", "sensitive_value"])
     return records, sensitive, exposure
 
 
-def load_vaers(data_root: Path, backend: str, cudf_min_mb: float) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+def load_vaers(
+    data_root: Path,
+    backend: str,
+    cudf_min_mb: float,
+    progress: bool,
+) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
     data_files = sorted(data_root.glob("2004-2012VAERSData/**/*VAERSDATA.csv"))
     record_frames: list[pl.DataFrame] = []
     sensitive_frames: list[pl.DataFrame] = []
     exposure_frames: list[pl.DataFrame] = []
     symptom_cols = [f"SYMPTOM{i}" for i in range(1, 6)]
 
-    for data_path in data_files:
+    for data_path in progress_iter(data_files, "VAERS years", "file", progress):
         year = year_from_path(data_path)
         if year is None or not 2004 <= year <= 2012:
             continue
@@ -546,7 +608,12 @@ def mimic_age_expr(subject_col: str = "subject_id", dob_col: str = "dob", admit_
     )
 
 
-def load_mimic(data_root: Path, backend: str, cudf_min_mb: float) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+def load_mimic(
+    data_root: Path,
+    backend: str,
+    cudf_min_mb: float,
+    progress: bool,
+) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
     mimic_root = data_root / "mimic-iii-clinical-database-demo-1.4"
     patients_path = mimic_root / "PATIENTS.csv"
     admissions_path = mimic_root / "ADMISSIONS.csv"
@@ -688,16 +755,21 @@ def ensure_unknown_sensitive(records: pl.DataFrame, sensitive: pl.DataFrame) -> 
     return pl.concat([sensitive, missing], how="diagonal_relaxed").unique(["record_key", "sensitive_value"])
 
 
-def normalize_records(data_root: Path, backend: str, cudf_min_mb: float) -> tuple[pl.DataFrame, pl.DataFrame]:
+def normalize_records(
+    data_root: Path,
+    backend: str,
+    cudf_min_mb: float,
+    progress: bool,
+) -> tuple[pl.DataFrame, pl.DataFrame]:
     started = now()
     loaders = [load_faers, load_vaers, load_mimic]
     record_frames: list[pl.DataFrame] = []
     sensitive_frames: list[pl.DataFrame] = []
     exposure_frames: list[pl.DataFrame] = []
 
-    for loader in loaders:
+    for loader in progress_iter(loaders, "Load sources", "source", progress, total=len(loaders), leave=True):
         t0 = now()
-        records, sensitive, exposure = loader(data_root, backend, cudf_min_mb)
+        records, sensitive, exposure = loader(data_root, backend, cudf_min_mb, progress)
         record_frames.append(records)
         sensitive_frames.append(sensitive)
         exposure_frames.append(exposure)
@@ -723,6 +795,7 @@ def normalize_records(data_root: Path, backend: str, cudf_min_mb: float) -> tupl
             pl.concat_str(VAERS_MIMIC_QID_COLS, separator="|").alias("qid_vaers_mimic"),
         )
         .select(OUTPUT_COLUMNS)
+        .unique(subset=["record_key"], keep="first")
     )
     log(f"normalized {records.height:,} records and {sensitive.height:,} sensitive rows in {now() - started:.1f}s")
     return records, sensitive
@@ -861,6 +934,8 @@ def c_bounded_sensitive(
     qid_cols: list[str],
     c: float,
     max_iterations: int,
+    progress: bool,
+    progress_desc: str,
 ) -> tuple[pl.DataFrame, int]:
     if not (0 < c < 1):
         raise ValueError("--c must be between 0 and 1")
@@ -872,45 +947,52 @@ def c_bounded_sensitive(
     suppressed = 0
     previous_count = sens.height + 1
 
-    for iteration in range(1, max_iterations + 1):
-        joined = sens.join(qid_map, on="record_key", how="inner")
-        probs = (
-            joined.group_by([*qid_cols, "sensitive_value"])
-            .len("qid_sensitive_count")
-            .join(den, on=qid_cols, how="left")
-            .with_columns((pl.col("qid_sensitive_count") / pl.col("qid_record_count")).alias("probability"))
-        )
-        offenders = probs.filter(pl.col("probability") > c)
-        if offenders.is_empty():
-            return sens, suppressed
-
-        offenders = (
-            offenders.with_columns(
-                (pl.col("qid_sensitive_count") - (c * pl.col("qid_record_count")).floor())
-                .cast(pl.Int64)
-                .clip(1)
-                .alias("drops_needed")
+    with progress_bar(max_iterations, progress_desc, "iter", progress) as bar:
+        for iteration in range(1, max_iterations + 1):
+            joined = sens.join(qid_map, on="record_key", how="inner")
+            probs = (
+                joined.group_by([*qid_cols, "sensitive_value"])
+                .len("qid_sensitive_count")
+                .join(den, on=qid_cols, how="left")
+                .with_columns((pl.col("qid_sensitive_count") / pl.col("qid_record_count")).alias("probability"))
             )
-            .select(*qid_cols, "sensitive_value", "drops_needed")
-        )
+            offenders = probs.filter(pl.col("probability") > c)
+            if offenders.is_empty():
+                bar.update(1)
+                bar.set_postfix_str(f"done suppressed={suppressed:,}")
+                return sens, suppressed
 
-        candidates = (
-            joined.join(offenders, on=[*qid_cols, "sensitive_value"], how="inner")
-            .sort([*qid_cols, "sensitive_value", "record_key"], descending=[*[False] * len(qid_cols), False, True])
-            .with_columns(pl.int_range(1, pl.len() + 1).over([*qid_cols, "sensitive_value"]).alias("_drop_rank"))
-            .filter(pl.col("_drop_rank") <= pl.col("drops_needed"))
-            .select("record_key", "sensitive_value")
-            .unique()
-        )
-        if candidates.is_empty():
-            return sens, suppressed
+            offenders = (
+                offenders.with_columns(
+                    (pl.col("qid_sensitive_count") - (c * pl.col("qid_record_count")).floor())
+                    .cast(pl.Int64)
+                    .clip(1)
+                    .alias("drops_needed")
+                )
+                .select(*qid_cols, "sensitive_value", "drops_needed")
+            )
 
-        before = sens.height
-        sens = sens.join(candidates, on=["record_key", "sensitive_value"], how="anti")
-        suppressed += before - sens.height
-        if sens.height == previous_count:
-            return sens, suppressed
-        previous_count = sens.height
+            candidates = (
+                joined.join(offenders, on=[*qid_cols, "sensitive_value"], how="inner")
+                .sort([*qid_cols, "sensitive_value", "record_key"], descending=[*[False] * len(qid_cols), False, True])
+                .with_columns(pl.int_range(1, pl.len() + 1).over([*qid_cols, "sensitive_value"]).alias("_drop_rank"))
+                .filter(pl.col("_drop_rank") <= pl.col("drops_needed"))
+                .select("record_key", "sensitive_value")
+                .unique()
+            )
+            if candidates.is_empty():
+                bar.update(1)
+                bar.set_postfix_str(f"no candidates suppressed={suppressed:,}")
+                return sens, suppressed
+
+            before = sens.height
+            sens = sens.join(candidates, on=["record_key", "sensitive_value"], how="anti")
+            suppressed += before - sens.height
+            bar.update(1)
+            bar.set_postfix_str(f"offenders={offenders.height:,} suppressed={suppressed:,}")
+            if sens.height == previous_count:
+                return sens, suppressed
+            previous_count = sens.height
 
     log(f"C-bounding hit iteration cap ({max_iterations}); returning best effort for qid={qid_cols}")
     return sens, suppressed
@@ -922,8 +1004,18 @@ def apply_c_bounding(
     qid_cols: list[str],
     c: float,
     max_iterations: int,
+    progress: bool,
+    progress_desc: str,
 ) -> tuple[pl.DataFrame, pl.DataFrame, int]:
-    protected_sensitive, suppressed = c_bounded_sensitive(records, sensitive, qid_cols, c, max_iterations)
+    protected_sensitive, suppressed = c_bounded_sensitive(
+        records,
+        sensitive,
+        qid_cols,
+        c,
+        max_iterations,
+        progress,
+        progress_desc,
+    )
     sensitive_values = aggregate_values(protected_sensitive, "sensitive_value", "sensitive_values")
     protected_records = (
         records.drop("sensitive_values", "primary_sensitive")
@@ -1007,50 +1099,88 @@ def write_outputs(
     top_n: int,
     max_iterations: int,
     backend: str,
+    progress: bool,
 ) -> dict[str, object]:
     output_dir.mkdir(parents=True, exist_ok=True)
     qid_inventory = qid_field_inventory()
 
     t0 = now()
-    three = build_intersection_candidates(
-        records, sensitive, ["FAERS", "VAERS", "MIMIC"], THREE_SOURCE_QID_COLS, top_n, "candidate_combination_count"
-    )
-    faers_vaers = build_intersection_candidates(
-        records, sensitive, ["FAERS", "VAERS"], FAERS_VAERS_QID_COLS, top_n, "candidate_pair_count"
-    )
-    faers_mimic = build_intersection_candidates(
-        records, sensitive, ["FAERS", "MIMIC"], FAERS_MIMIC_QID_COLS, top_n, "candidate_pair_count"
-    )
-    vaers_mimic = build_intersection_candidates(
-        records, sensitive, ["VAERS", "MIMIC"], VAERS_MIMIC_QID_COLS, top_n, "candidate_pair_count"
-    )
+    candidate_specs = [
+        ("three", "FAERS+VAERS+MIMIC", ["FAERS", "VAERS", "MIMIC"], THREE_SOURCE_QID_COLS, "candidate_combination_count"),
+        ("faers_vaers", "FAERS+VAERS", ["FAERS", "VAERS"], FAERS_VAERS_QID_COLS, "candidate_pair_count"),
+        ("faers_mimic", "FAERS+MIMIC", ["FAERS", "MIMIC"], FAERS_MIMIC_QID_COLS, "candidate_pair_count"),
+        ("vaers_mimic", "VAERS+MIMIC", ["VAERS", "MIMIC"], VAERS_MIMIC_QID_COLS, "candidate_pair_count"),
+    ]
+    candidates: dict[str, pl.DataFrame] = {}
+    with progress_bar(len(candidate_specs), "Build candidates", "scope", progress, leave=True) as bar:
+        for key, label, sources, qid_cols, count_col in candidate_specs:
+            bar.set_postfix_str(label)
+            candidates[key] = build_intersection_candidates(records, sensitive, sources, qid_cols, top_n, count_col)
+            bar.update(1)
+    three = candidates["three"]
+    faers_vaers = candidates["faers_vaers"]
+    faers_mimic = candidates["faers_mimic"]
+    vaers_mimic = candidates["vaers_mimic"]
     log(f"built intersection candidates in {now() - t0:.1f}s")
 
-    matched = matched_records_for_candidates(records, three, ["FAERS", "VAERS", "MIMIC"], THREE_SOURCE_QID_COLS)
-    faers_vaers_matched = matched_records_for_candidates(records, faers_vaers, ["FAERS", "VAERS"], FAERS_VAERS_QID_COLS)
-    faers_mimic_matched = matched_records_for_candidates(records, faers_mimic, ["FAERS", "MIMIC"], FAERS_MIMIC_QID_COLS)
-    vaers_mimic_matched = matched_records_for_candidates(records, vaers_mimic, ["VAERS", "MIMIC"], VAERS_MIMIC_QID_COLS)
+    matched_specs = [
+        ("matched", "FAERS+VAERS+MIMIC", three, ["FAERS", "VAERS", "MIMIC"], THREE_SOURCE_QID_COLS),
+        ("faers_vaers", "FAERS+VAERS", faers_vaers, ["FAERS", "VAERS"], FAERS_VAERS_QID_COLS),
+        ("faers_mimic", "FAERS+MIMIC", faers_mimic, ["FAERS", "MIMIC"], FAERS_MIMIC_QID_COLS),
+        ("vaers_mimic", "VAERS+MIMIC", vaers_mimic, ["VAERS", "MIMIC"], VAERS_MIMIC_QID_COLS),
+    ]
+    matched_tables: dict[str, pl.DataFrame] = {}
+    with progress_bar(len(matched_specs), "Match records", "scope", progress, leave=True) as bar:
+        for key, label, candidate_df, sources, qid_cols in matched_specs:
+            bar.set_postfix_str(label)
+            matched_tables[key] = matched_records_for_candidates(records, candidate_df, sources, qid_cols)
+            bar.update(1)
+    matched = matched_tables["matched"]
+    faers_vaers_matched = matched_tables["faers_vaers"]
+    faers_mimic_matched = matched_tables["faers_mimic"]
+    vaers_mimic_matched = matched_tables["vaers_mimic"]
 
     t0 = now()
-    probabilities_three = probability_table(matched if not matched.is_empty() else records, sensitive, THREE_SOURCE_QID_COLS, "three_source_full_qid")
-    probabilities_faers_vaers = probability_table(
-        faers_vaers_matched if not faers_vaers_matched.is_empty() else records.filter(pl.col("source").is_in(["FAERS", "VAERS"])),
-        sensitive,
-        FAERS_VAERS_QID_COLS,
-        "faers_vaers_full_qid",
-    )
-    probabilities_faers_mimic = probability_table(
-        faers_mimic_matched if not faers_mimic_matched.is_empty() else records.filter(pl.col("source").is_in(["FAERS", "MIMIC"])),
-        sensitive,
-        FAERS_MIMIC_QID_COLS,
-        "faers_mimic_full_qid",
-    )
-    probabilities_vaers_mimic = probability_table(
-        vaers_mimic_matched if not vaers_mimic_matched.is_empty() else records.filter(pl.col("source").is_in(["VAERS", "MIMIC"])),
-        sensitive,
-        VAERS_MIMIC_QID_COLS,
-        "vaers_mimic_full_qid",
-    )
+    probability_specs = [
+        (
+            "three",
+            "FAERS+VAERS+MIMIC",
+            matched if not matched.is_empty() else records,
+            THREE_SOURCE_QID_COLS,
+            "three_source_full_qid",
+        ),
+        (
+            "faers_vaers",
+            "FAERS+VAERS",
+            faers_vaers_matched if not faers_vaers_matched.is_empty() else records.filter(pl.col("source").is_in(["FAERS", "VAERS"])),
+            FAERS_VAERS_QID_COLS,
+            "faers_vaers_full_qid",
+        ),
+        (
+            "faers_mimic",
+            "FAERS+MIMIC",
+            faers_mimic_matched if not faers_mimic_matched.is_empty() else records.filter(pl.col("source").is_in(["FAERS", "MIMIC"])),
+            FAERS_MIMIC_QID_COLS,
+            "faers_mimic_full_qid",
+        ),
+        (
+            "vaers_mimic",
+            "VAERS+MIMIC",
+            vaers_mimic_matched if not vaers_mimic_matched.is_empty() else records.filter(pl.col("source").is_in(["VAERS", "MIMIC"])),
+            VAERS_MIMIC_QID_COLS,
+            "vaers_mimic_full_qid",
+        ),
+    ]
+    probability_tables: dict[str, pl.DataFrame] = {}
+    with progress_bar(len(probability_specs), "Compute probabilities", "scope", progress, leave=True) as bar:
+        for key, label, scoped_records, qid_cols, scope_name in probability_specs:
+            bar.set_postfix_str(label)
+            probability_tables[key] = probability_table(scoped_records, sensitive, qid_cols, scope_name)
+            bar.update(1)
+    probabilities_three = probability_tables["three"]
+    probabilities_faers_vaers = probability_tables["faers_vaers"]
+    probabilities_faers_mimic = probability_tables["faers_mimic"]
+    probabilities_vaers_mimic = probability_tables["vaers_mimic"]
     probabilities = concat_frames([probabilities_three, probabilities_faers_vaers, probabilities_faers_mimic, probabilities_vaers_mimic])
     log(f"computed probabilities in {now() - t0:.1f}s")
 
@@ -1061,6 +1191,8 @@ def write_outputs(
         THREE_SOURCE_QID_COLS,
         c,
         max_iterations,
+        progress,
+        "C-bound FAERS+VAERS+MIMIC",
     )
     protected_faers_vaers, protected_sensitive_faers_vaers, suppressed_sensitive_faers_vaers = apply_c_bounding(
         faers_vaers_matched if not faers_vaers_matched.is_empty() else records.filter(pl.col("source").is_in(["FAERS", "VAERS"])),
@@ -1068,6 +1200,8 @@ def write_outputs(
         FAERS_VAERS_QID_COLS,
         c,
         max_iterations,
+        progress,
+        "C-bound FAERS+VAERS",
     )
     protected_faers_mimic, protected_sensitive_faers_mimic, suppressed_sensitive_faers_mimic = apply_c_bounding(
         faers_mimic_matched if not faers_mimic_matched.is_empty() else records.filter(pl.col("source").is_in(["FAERS", "MIMIC"])),
@@ -1075,6 +1209,8 @@ def write_outputs(
         FAERS_MIMIC_QID_COLS,
         c,
         max_iterations,
+        progress,
+        "C-bound FAERS+MIMIC",
     )
     protected_vaers_mimic, protected_sensitive_vaers_mimic, suppressed_sensitive_vaers_mimic = apply_c_bounding(
         vaers_mimic_matched if not vaers_mimic_matched.is_empty() else records.filter(pl.col("source").is_in(["VAERS", "MIMIC"])),
@@ -1082,31 +1218,45 @@ def write_outputs(
         VAERS_MIMIC_QID_COLS,
         c,
         max_iterations,
+        progress,
+        "C-bound VAERS+MIMIC",
     )
-    protected_prob = concat_frames(
-        [
-            probability_table(protected, protected_sensitive, THREE_SOURCE_QID_COLS, "three_source_full_qid_protected"),
-            probability_table(protected_faers_vaers, protected_sensitive_faers_vaers, FAERS_VAERS_QID_COLS, "faers_vaers_full_qid_protected"),
-            probability_table(protected_faers_mimic, protected_sensitive_faers_mimic, FAERS_MIMIC_QID_COLS, "faers_mimic_full_qid_protected"),
-            probability_table(protected_vaers_mimic, protected_sensitive_vaers_mimic, VAERS_MIMIC_QID_COLS, "vaers_mimic_full_qid_protected"),
-        ]
-    )
+    protected_prob_specs = [
+        ("FAERS+VAERS+MIMIC", protected, protected_sensitive, THREE_SOURCE_QID_COLS, "three_source_full_qid_protected"),
+        ("FAERS+VAERS", protected_faers_vaers, protected_sensitive_faers_vaers, FAERS_VAERS_QID_COLS, "faers_vaers_full_qid_protected"),
+        ("FAERS+MIMIC", protected_faers_mimic, protected_sensitive_faers_mimic, FAERS_MIMIC_QID_COLS, "faers_mimic_full_qid_protected"),
+        ("VAERS+MIMIC", protected_vaers_mimic, protected_sensitive_vaers_mimic, VAERS_MIMIC_QID_COLS, "vaers_mimic_full_qid_protected"),
+    ]
+    protected_prob_frames: list[pl.DataFrame] = []
+    with progress_bar(len(protected_prob_specs), "Protected probabilities", "scope", progress, leave=True) as bar:
+        for label, protected_records, protected_sensitive_rows, qid_cols, scope_name in protected_prob_specs:
+            bar.set_postfix_str(label)
+            protected_prob_frames.append(probability_table(protected_records, protected_sensitive_rows, qid_cols, scope_name))
+            bar.update(1)
+    protected_prob = concat_frames(protected_prob_frames)
     log(f"applied C-bounding in {now() - t0:.1f}s")
 
     t0 = now()
-    write_csv(records, output_dir / "source_records.csv")
-    write_csv(qid_inventory, output_dir / "qid_field_inventory.csv")
-    write_csv(three, output_dir / "intersection_three_source_candidates.csv")
-    write_csv(faers_vaers, output_dir / "intersection_faers_vaers_candidates.csv")
-    write_csv(faers_mimic, output_dir / "intersection_faers_mimic_candidates.csv")
-    write_csv(vaers_mimic, output_dir / "intersection_vaers_mimic_candidates.csv")
-    write_csv(matched, output_dir / "matched_patient_details.csv")
-    write_csv(probabilities, output_dir / "qid_sensitive_probability.csv")
-    write_csv(protected, output_dir / "protected_c_bounded_records.csv")
-    write_csv(protected_faers_vaers, output_dir / "protected_faers_vaers_c_bounded_records.csv")
-    write_csv(protected_faers_mimic, output_dir / "protected_faers_mimic_c_bounded_records.csv")
-    write_csv(protected_vaers_mimic, output_dir / "protected_vaers_mimic_c_bounded_records.csv")
-    write_csv(protected_prob, output_dir / "protected_c_bounded_probability.csv")
+    output_specs = [
+        ("source_records.csv", records),
+        ("qid_field_inventory.csv", qid_inventory),
+        ("intersection_three_source_candidates.csv", three),
+        ("intersection_faers_vaers_candidates.csv", faers_vaers),
+        ("intersection_faers_mimic_candidates.csv", faers_mimic),
+        ("intersection_vaers_mimic_candidates.csv", vaers_mimic),
+        ("matched_patient_details.csv", matched),
+        ("qid_sensitive_probability.csv", probabilities),
+        ("protected_c_bounded_records.csv", protected),
+        ("protected_faers_vaers_c_bounded_records.csv", protected_faers_vaers),
+        ("protected_faers_mimic_c_bounded_records.csv", protected_faers_mimic),
+        ("protected_vaers_mimic_c_bounded_records.csv", protected_vaers_mimic),
+        ("protected_c_bounded_probability.csv", protected_prob),
+    ]
+    with progress_bar(len(output_specs), "Write CSV", "file", progress, leave=True) as bar:
+        for filename, df in output_specs:
+            bar.set_postfix_str(filename)
+            write_csv(df, output_dir / filename)
+            bar.update(1)
     log(f"wrote CSV outputs in {now() - t0:.1f}s")
 
     source_counts = dict(records.group_by("source").len("count").iter_rows())
@@ -1190,7 +1340,8 @@ def main() -> None:
     args = parse_args()
     total_started = now()
     data_root = Path(args.data_root)
-    records, sensitive = normalize_records(data_root, args.backend, args.cudf_min_mb)
+    progress = not args.no_progress
+    records, sensitive = normalize_records(data_root, args.backend, args.cudf_min_mb, progress)
     summary = write_outputs(
         records,
         sensitive,
@@ -1199,6 +1350,7 @@ def main() -> None:
         args.top_sensitive,
         args.max_c_bound_iterations,
         args.backend,
+        progress,
     )
     summary["elapsed_seconds"] = round(now() - total_started, 3)
     (Path(args.output_dir) / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
